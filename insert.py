@@ -1,13 +1,11 @@
 import logging
 import os
-
 import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+
 
 DB_URL = os.getenv(
     "DATABASE_URL",
@@ -43,15 +41,62 @@ def get_conn():
     try:
         conn = psycopg2.connect(DB_URL)
         conn.autocommit = False
-        log.info("Connected to PostgreSQL successfully")
         return conn
     except psycopg2.OperationalError as e:
-        log.error(f"Cannot connect to PostgreSQL: {e}")
-        log.error("Check DATABASE_URL in your .env file")
         raise
 
 def init_schema(conn):
     with conn.cursor() as cur:
         cur.execute(SCHEMA)
     conn.commit()
-    log.info("Database schema initialized")
+
+def load(products: list[dict]):
+   
+    conn = get_conn()
+    init_schema(conn)
+
+    inserted = updated = failed = 0
+
+    with conn:
+        with conn.cursor() as cur:
+            for p in products:
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO products (url, name, image_url, first_seen, last_updated)
+                        VALUES (%s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (url) DO UPDATE
+                            SET name         = EXCLUDED.name,
+                                last_updated = NOW()
+                        RETURNING id, (xmax = 0) AS is_insert
+                        """,
+                        (p["url"], p["name"], p.get("image_url"))
+                    )
+                    product_id, is_insert = cur.fetchone()
+                    inserted += 1 if is_insert else 0
+                    updated  += 0 if is_insert else 1
+
+                    cur.execute(
+                        """
+                        INSERT INTO price_logs
+                            (product_id, scraped_at, current_price, original_price,
+                             discount_pct, rating, review_count)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            product_id,
+                            p["scraped_at"],
+                            p["current_price_ksh"],
+                            p.get("original_price_ksh"),
+                            p.get("discount_pct"),
+                            p.get("rating"),
+                            p.get("review_count"),
+                        )
+                    )
+
+                except Exception as e:
+                    conn.rollback()
+                    failed += 1
+                    continue
+
+    conn.close()
